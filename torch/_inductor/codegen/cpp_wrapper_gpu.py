@@ -560,10 +560,21 @@ class CppWrapperGpu(CppWrapperCpu):
             )
             kernel_var_name = self.generate_load_kernel_once(kernel_name, V.graph)
             if triton_version_uses_attrs_dict():
+                signature = triton_meta["signature"]
                 arg_signatures = [
                     val
-                    for key, val in triton_meta["signature"].items()
+                    for key, val in signature.items()
                     if val != "constexpr"
+                ]
+                call_args = [
+                    call_arg
+                    for call_arg, arg_name in zip(call_args, signature)
+                    if signature[arg_name] != "constexpr"
+                ]
+                arg_types = [
+                    arg_type
+                    for arg_type, arg_name in zip(arg_types, signature)
+                    if signature[arg_name] != "constexpr"
                 ]
             else:
                 # args with value 1 are added into equal_to_1 and constants
