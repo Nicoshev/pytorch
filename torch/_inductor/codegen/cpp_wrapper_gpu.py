@@ -562,9 +562,7 @@ class CppWrapperGpu(CppWrapperCpu):
             if triton_version_uses_attrs_dict():
                 signature = triton_meta["signature"]
                 arg_signatures = [
-                    val
-                    for key, val in signature.items()
-                    if val != "constexpr"
+                    val for val in signature.values() if val != "constexpr"
                 ]
                 call_args = [
                     call_arg
