@@ -30,7 +30,7 @@ from torch._higher_order_ops.utils import (
     validate_subgraph_args_types,
 )
 from torch._ops import HigherOrderOperator
-from torch._subclasses.fake_tensor import FakeTensorMode
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch._subclasses.functional_tensor import disable_functional_mode
 from torch.fx.experimental.proxy_tensor import (
     _temp_remove_metadata_torch_function_mode,
@@ -39,7 +39,6 @@ from torch.fx.experimental.proxy_tensor import (
     ProxyTorchDispatchMode,
     track_tensor_tree,
 )
-from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.utils._python_dispatch import _get_current_dispatch_mode
 
 from .utils import _from_fun, _maybe_fake_prop_ignore_unbacked, create_fw_bw_graph
@@ -269,55 +268,6 @@ def trace_cond(proxy_mode, func_overload, pred, true_fn, false_fn, operands):
             f"\n  false branch returns {len(flat_false_outs)} item(s)"
         )
 
-    for i in range(0, len(flat_true_outs)):
-        true_out = flat_true_outs[i]
-        false_out = flat_false_outs[i]
-
-        # Note that we need skip the check for requires_grad because we're after
-        # after autograd key during tracing, so the rquires_grad attribute of the tensors
-        # are no longer. See Note [invariants for node meta 'val']
-        def _same_meta_except_requires_grad(true_out, false_out):
-            if true_out is None and false_out is None:
-                return True
-            elif true_out is None or false_out is None:
-                # Consider the following case:
-                # def true_fn(x, y):
-                #   return x * y
-                #
-                # def false_fn(x, y):
-                #   return x.sin()
-                #
-                # We'll get the following graphs for backward:
-                # def backward_true_fn(x, y, grad_out):
-                #  return grad_out * y, grad_out * x
-                #
-                # def backward_false_fn(x, y, grad_out):
-                #  retrun grad_out, None
-                #
-                # This suggests that when we make_fx into the backward graph,
-                # the output graph would produce outputs with metadata, this is undesirable.
-                #
-                # Ideally, we should provide an optional type to indicate that one of the branches might
-                # return None. But we'll just let it pass for now and let downstream/runtime handle.
-                #
-                # Note that this corner case should **only** happen when user want to trace backward graph because
-                # if it's foward, dynamo will error.
-                return True
-            true_meta = true_out.meta.get("tensor_meta", None)
-            false_meta = false_out.meta.get("tensor_meta", None)
-            return (
-                true_meta.shape == false_meta.shape
-                and true_meta.dtype == false_meta.dtype
-                and true_meta.stride == false_meta.stride
-            )
-
-        if not _same_meta_except_requires_grad(true_out, false_out):
-            raise torch._dynamo.exc.CondOpArgsMismatchError(
-                f"Expected each tensor to have same metadata but got:"
-                f"\n  {true_fn.__name__} returns {true_out.meta['tensor_meta']}"
-                f"\n  {false_fn.__name__} returns {false_out.meta['tensor_meta']}"
-            )
-
     i, true_name = unique_graph_id(proxy_mode, prefix="true_graph")
 
     false_name = f"false_graph_{i}"
@@ -429,30 +379,215 @@ def cond_fake_tensor_mode(mode, pred, true_fn, false_fn, operands):
         ignore_fresh_unbacked = mode.shape_env.ignore_fresh_unbacked_symbols()
 
     with mode, ignore_fresh_unbacked:
-        true_outs = true_fn(*operands)
-        flat_true_outs = pytree.tree_leaves(true_outs)
-        flat_false_outs = pytree.tree_leaves(false_fn(*operands))
-    if len(flat_true_outs) != len(flat_false_outs):
-        raise RuntimeError("Unmatched number of outputs from cond() branches.")
+        flat_true_outs, true_out_spec = pytree.tree_flatten(true_fn(*operands))
+        flat_false_outs, false_out_spec = pytree.tree_flatten(false_fn(*operands))
+        if true_out_spec != false_out_spec:
+            raise RuntimeError(
+                "Unmatched output spec from torch.cond branches: "
+                f"true branch tree_spec {true_out_spec} vs false branch tree_spec {false_out_spec}."
+            )
 
+    merged_outs = []
     for true_out, false_out in zip(flat_true_outs, flat_false_outs):
-        if true_out is None or false_out is None:
-            if true_out is None and false_out is None:
+        merged_outs.append(_merge_tensors(true_out, false_out, mode))
+    return pytree.tree_unflatten(merged_outs, true_out_spec)
+
+
+def check_tensor_meta_match(
+    t1: torch.Tensor, t2: torch.Tensor, attr_names: tuple[str, ...], msg_prefix: str
+) -> None:
+    def _get_attr_maybe_call(t: torch.Tensor, attr_name: str) -> Any:
+        attr = getattr(t, attr_name)
+        if callable(attr):
+            return attr()
+        return attr
+
+    for attr_name in attr_names:
+        lattr = _get_attr_maybe_call(t1, attr_name)
+        rattr = _get_attr_maybe_call(t2, attr_name)
+        torch._check(
+            lattr == rattr,
+            lambda: f"{msg_prefix} expected same {attr_name} but got {lattr} and {rattr}.",
+        )
+
+
+def _merge_tensors(a: torch.Tensor, b: torch.Tensor, mode: FakeTensorMode):
+    assert type(a) is FakeTensor and type(b) is FakeTensor, (a, b)
+    from torch.fx.experimental.symbolic_shapes import (
+        _nested_int_aware_sort,
+        SymIntEqByExpr,
+    )
+    from torch.utils._sympy.value_ranges import ValueRanges
+
+    if a is None or b is None:
+        assert a is None and b is None, (a, b)
+        return None
+
+    # Note: we don't check size,stride and storage_offset because
+    # they'll be merged with unbacked symints if they differ.
+    _meta_to_check = {
+        "dtype",
+        "device",
+        "layout",
+        "dim",
+        "is_quantized",
+        "is_conj",
+        "is_sparse",
+    }
+    check_tensor_meta_match(
+        a,
+        b,
+        tuple(_meta_to_check),
+        msg_prefix="When merging two branches' output in torch.cond, ",
+    )
+    # NYI
+    assert not a.is_quantized and not b.is_quantized
+    assert not a.is_sparse and not b.is_sparse
+    assert not a.is_conj() and not b.is_conj()
+
+    """
+    Step 1: create unbacked symints for sizes that are different
+    along the same axis. For example:
+        a.size is [s0, 4, s0, 5, 4, 5]
+        b.size is [s1, 4, s2, 8, 4, 7]
+        merged_size will be [u0, 4, u1, u2, 4, u3], where
+        u0 has range [min(s0, s1), max(s0, s1)]
+        u1 has range [min(s0, s2), max(s0, s2)]
+        u2 has range [5, 8]
+        u3 has range [5, 7]
+    """
+    merged_size: list[Union[int, torch.SymInt]] = []
+    for s0, s1 in zip(a.size(), b.size()):
+        if SymIntEqByExpr(s0) == SymIntEqByExpr(s1):
+            merged_size.append(s0)
+        else:
+
+            def min_max(s0, s1):
+                def _bound(s0, lower_bound: bool):
+                    if isinstance(s0, int):
+                        return s0
+                    r = mode.shape_env.var_to_range.get(  # type: ignore[union-attr]
+                        s0.node.expr,
+                        torch.utils._sympy.value_ranges.ValueRanges.unknown(),
+                    )
+                    return r.lower if lower_bound else r.upper
+
+                return min(_bound(s0, True), _bound(s1, True)), max(
+                    _bound(s0, False), _bound(s1, False)
+                )
+
+            assert mode.shape_env is not None
+            new_size = mode.shape_env.create_unbacked_symint()
+            mode.shape_env._update_var_to_range(
+                new_size.node.expr, ValueRanges(*min_max(s0, s1))
+            )
+            merged_size.append(new_size)
+
+    """
+    This follows the logic in symbolic_shapes._compute_symbolic_stride
+    Step 2: Since tensor stride is an accumulative muliplication of the sizes, which is a permutated
+        (due to view ops) non-decending sequence.
+
+        Case 1: No size is 1. In this case, strides have unique values.
+            For example, suppose we have a tenosr with:
+            size [3, 4, 3, 5, 4, 5],
+            stride (1200, 300, 1, 12, 3, 60),
+            merged_size [u0, u1, u2, u3, u4, u5].
+
+            We visit the strides in ascending order: 1, 3, 12, 60, 300, 1200. In each step, we check whether
+            the current stride is bounded or not and bound next stride by setting.
+                stride_expr[next_stride] = current_stride_expr * current_size_expr
+            1st round:
+                current_stride is 1, current_size is 3, so next_stride is 1 * 3 = 3,
+                current_stride_expr is set to 1, current_size_expr is u2, so stride_expr[3] is therefore 1 * u2 = u2
+            2nd round:
+                current_stride is 3, current_size is 4, so next_stride is 3 * 4 = 12,
+                current_stride_expr is stride_expr[3] i.e. u2, current_size_expr is u4, so stride_expr[12] = u2 * u4
+                ...
+
+        Case 2: At least one dimension has size 1, which can produce duplicates in strides.
+            In this case, theorectically, we cannot uniquely determine the expr of strides because
+            the accessing stride_expr with same key in different order causes the final stride expression
+            to be different.
+
+            Suppose we have:
+                size: (3, 1)
+                stride: (1, 1)
+                merged_size: (u0, u1)
+
+            The stride expr could either be (u1, 1) or (1, u0) depending on whether we start with u1 or u0.
+            For this reason, we try to break tie by sorting via decending index so we always get (u1, 1).
+
+            Note that backend might optimize the strides anyway so this is usually not a problem as long
+            as two branches matches. See relevant discussions in https://github.com/pytorch/pytorch/issues/142024.
+
+        Case 3: Dim has 0 stride. 0 stride doesn't participate in the accumulative multiplication of
+            sizes. So they're always treated as constant even if their corresponding size is turned into unbacked symint.
+
+            Suppose we have:
+                size: (3, 3)
+                stride: (0, 1)
+                merged_size: (u0, u1)
+
+            The merged stride would be (0, 1)
+    """
+
+    def _bound_stride(
+        ex_size: torch.Size,
+        ex_stride: tuple[int, ...],
+        merged_size: list[Union[int, torch.SymInt]],
+    ) -> list[Union[int, torch.SymInt]]:
+        stride_li: list[tuple[Union[int, torch.SymInt], int]] = [
+            (val, -i) for i, val in enumerate(ex_stride)
+        ]
+        stride_li.sort(key=_nested_int_aware_sort)
+        stride_expr: dict[Any, Union[int, torch.SymInt]] = {}
+
+        def _maybe_expr(s: Union[int, torch.SymInt]):
+            if isinstance(s, int):
+                return s
+            return s.node.expr
+
+        bounded_strides: list[Union[int, torch.SymInt]] = [None] * len(ex_stride)  # type: ignore[list-item]
+        for val, neg_i in stride_li:
+            i = -neg_i
+            if val == 0:
+                bounded_strides[i] = val
                 continue
-            raise torch._dynamo.exc.CondOpArgsMismatchError(
-                f"Expected both branches to return None:"
-                f"\n  {true_fn.__name__} returns {true_out}"
-                f"\n  {false_fn.__name__} returns {false_out}"
+
+            if _maybe_expr(val) in stride_expr:
+                bounded_strides[i] = stride_expr[_maybe_expr(val)]
+            else:
+                assert (
+                    val == 1
+                ), "strides that are neither 0 or 1 should be bound already"
+                bounded_strides[i] = val
+            stride_expr[_maybe_expr(val * ex_size[i])] = (
+                bounded_strides[i] * merged_size[i]
             )
-        true_meta = _extract_tensor_metadata(true_out)
-        false_meta = _extract_tensor_metadata(false_out)
-        if true_meta != false_meta:
-            raise torch._dynamo.exc.CondOpArgsMismatchError(
-                f"Expected each tensor to have same metadata but got:"
-                f"\n  {true_fn.__name__} returns {true_meta}"
-                f"\n  {false_fn.__name__} returns {false_meta}"
-            )
-    return true_outs
+        return bounded_strides
+
+    a_stride: list[Union[int, torch.SymInt]] = _bound_stride(
+        a.size(), a.stride(), merged_size
+    )
+    b_stride: list[Union[int, torch.SymInt]] = _bound_stride(
+        b.size(), b.stride(), merged_size
+    )
+    """
+    Step 3: Check the newly bounded strides of the two tensors are the same. If not, we will raise an error.
+    """
+    torch._check(
+        a_stride == b_stride,
+        lambda: f"Fail to merge two branches output's strides. Consider call contiguous() for outputs before return"
+        f" Specifically, true branch return has size {a.size()} vs False branch return size {b.size()}, torch.cond try to"
+        f" merge into an output of size: {merged_size}. However, calculated merged stride of true branch to be {a_stride}"
+        f" vs False branch stride {b_stride} don't match.",
+    )
+
+    with mode:
+        return torch.empty_strided(
+            merged_size, a_stride, dtype=a.dtype, device=a.device
+        )
 
 
 @cond_op.py_functionalize_impl
