@@ -630,6 +630,11 @@ class TestOperators(TestCase):
         "test_jvp",
         (
             tol1(
+                "pow",
+                {torch.float32: tol(atol=1e-05, rtol=2.1e-06)},
+                device_type="cpu",
+            ),
+            tol1(
                 "nn.functional.conv_transpose3d",
                 {torch.float32: tol(atol=1e-04, rtol=1.3e-06)},
                 device_type="cuda",
